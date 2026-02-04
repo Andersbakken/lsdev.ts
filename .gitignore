@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+jspm_packages/
+
+# Build output
+dist/
+build/
+
+# TypeScript cache
+.cache/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.test
+
+# IDE
+.idea/
+.vscode/
+
+# Coverage
+coverage/
+
+# Misc
+.DS_Store
+*.log

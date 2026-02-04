@@ -1,0 +1,18 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "ESNext",
+        "lib": ["ES2022"],
+        "moduleResolution": "node",
+        "newLine": "LF",
+        "strict": true,
+        "noImplicitAny": true,
+        "strictNullChecks": true,
+        "strictPropertyInitialization": true,
+        "esModuleInterop": true,
+        "sourceMap": true,
+        "incremental": true,
+        "baseUrl": ".",
+        "pretty": true
+    }
+}
