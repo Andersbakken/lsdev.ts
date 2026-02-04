@@ -172,6 +172,102 @@ function expandHome(filepath: string): string {
     return filepath;
 }
 
+/**
+ * Expand glob patterns in a path. Supports * and ? wildcards.
+ * Returns an array of matching paths (directories only).
+ */
+function expandGlob(pattern: string, base?: string): string[] {
+    // Expand ~ first
+    pattern = expandHome(pattern);
+
+    // Make absolute if relative
+    if (!path.isAbsolute(pattern) && base) {
+        pattern = path.resolve(base, pattern);
+    }
+
+    // If no wildcards, just return the path if it exists
+    if (!pattern.includes("*") && !pattern.includes("?")) {
+        if (cisdir(pattern)) {
+            return [pattern];
+        }
+        return [];
+    }
+
+    // Split into parts and find the first part with a wildcard
+    const parts = pattern.split("/");
+    let staticPart = "";
+    let wildcardIndex = -1;
+
+    for (let i = 0; i < parts.length; i++) {
+        if (parts[i].includes("*") || parts[i].includes("?")) {
+            wildcardIndex = i;
+            break;
+        }
+        staticPart = staticPart ? path.join(staticPart, parts[i]) : (parts[i] || "/");
+    }
+
+    if (wildcardIndex === -1) {
+        // No wildcard found (shouldn't happen given the check above)
+        return cisdir(pattern) ? [pattern] : [];
+    }
+
+    // Convert wildcard pattern to regex
+    const wildcardPart = parts[wildcardIndex];
+    const regexPattern = wildcardPart
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")  // Escape regex special chars
+        .replace(/\*/g, ".*")                    // * matches anything
+        .replace(/\?/g, ".");                    // ? matches single char
+    const regex = new RegExp(`^${regexPattern}$`);
+
+    const results: string[] = [];
+
+    // Read the static directory and match entries
+    if (!cisdir(staticPart)) {
+        return [];
+    }
+
+    try {
+        const entries = fs.readdirSync(staticPart);
+        for (const entry of entries) {
+            if (entry === "." || entry === "..") continue;
+            if (!regex.test(entry)) continue;
+
+            const fullPath = path.join(staticPart, entry);
+            if (!cisdir(fullPath)) continue;
+
+            // If there are more parts after the wildcard, recurse
+            if (wildcardIndex < parts.length - 1) {
+                const remainingPattern = parts.slice(wildcardIndex + 1).join("/");
+                const subResults = expandGlob(remainingPattern, fullPath);
+                results.push(...subResults);
+            } else {
+                results.push(fullPath);
+            }
+        }
+    } catch {
+        // Ignore read errors
+    }
+
+    return results;
+}
+
+/**
+ * Expand a path that may contain wildcards, returning all matching directories.
+ * If no wildcards, returns the single path in an array (if it exists as a directory).
+ */
+function expandPath(pathPattern: string, base?: string): string[] {
+    pathPattern = expandHome(pathPattern);
+    if (!path.isAbsolute(pathPattern) && base) {
+        pathPattern = path.resolve(base, pathPattern);
+    }
+
+    if (pathPattern.includes("*") || pathPattern.includes("?")) {
+        return expandGlob(pathPattern, base);
+    }
+
+    return [pathPattern];
+}
+
 // ============================================================================
 // Argument Parsing
 // ============================================================================
@@ -334,15 +430,63 @@ function parseConfig(file: string): PathConfig {
     return result;
 }
 
-function parseFileMap(file: string): Map<string, string> {
+interface ParsedFileMap {
+    entries: Map<string, string>;      // Regular name=path entries (expanded from wildcards)
+    builds: string[];                   // Directories to scan for builds
+    sources: string[];                  // Directories to scan for sources
+}
+
+function parseFileMap(file: string): ParsedFileMap {
     const config = parseConfig(file);
-    const result = new Map<string, string>();
+    const result: ParsedFileMap = {
+        entries: new Map<string, string>(),
+        builds: [],
+        sources: []
+    };
     const dir = path.dirname(file);
+
     for (const [name, value] of Object.entries(config)) {
-        if (value) {
+        if (!value) continue;
+
+        // Handle special "builds" key
+        if (name === "builds") {
+            for (const b of value.split(",")) {
+                const trimmed = b.trim();
+                const expanded = expandPath(trimmed, dir);
+                for (const p of expanded) {
+                    if (verbose) display(` Build dir: ${p}\n`);
+                    result.builds.push(p);
+                }
+            }
+            continue;
+        }
+
+        // Handle special "sources" key
+        if (name === "sources") {
+            for (const s of value.split(",")) {
+                const trimmed = s.trim();
+                const expanded = expandPath(trimmed, dir);
+                for (const p of expanded) {
+                    if (verbose) display(` Source dir: ${p}\n`);
+                    result.sources.push(p);
+                }
+            }
+            continue;
+        }
+
+        // Check if value contains wildcards
+        if (value.includes("*") || value.includes("?")) {
+            const expanded = expandPath(value, dir);
+            for (const p of expanded) {
+                // Generate name from the expanded path
+                const entryName = path.basename(p);
+                if (verbose) display(` Mapped (glob): ${entryName} -> ${p}\n`);
+                result.entries.set(entryName, p);
+            }
+        } else {
             const p = canonicalize(value, dir);
             if (verbose) display(` Mapped: ${name} -> ${p}\n`);
-            result.set(name, p);
+            result.entries.set(name, p);
         }
     }
     return result;
@@ -956,8 +1100,33 @@ async function main(): Promise<void> {
                         config[key] = finalValue;
                     } else {
                         if (key === "builds") {
+                            // builds= supports comma-separated values and wildcards
                             for (const b of value.split(",")) {
-                                buildRoots.push(canonicalize(b.trim(), path.dirname(devDirectoriesPath)));
+                                const trimmed = b.trim();
+                                const expanded = expandPath(trimmed, path.dirname(devDirectoriesPath));
+                                for (const p of expanded) {
+                                    if (verbose) display(`Found Build Root: ${p}\n`);
+                                    buildRoots.push(p);
+                                }
+                            }
+                        } else if (key === "sources") {
+                            // sources= supports comma-separated values and wildcards
+                            for (const s of value.split(",")) {
+                                const trimmed = s.trim();
+                                const expanded = expandPath(trimmed, path.dirname(devDirectoriesPath));
+                                for (const p of expanded) {
+                                    if (verbose) display(`Found Source Root: ${p}\n`);
+                                    devRoots.set(`sources_${path.basename(p)}`, p);
+                                }
+                            }
+                        } else if (value.includes("*") || value.includes("?")) {
+                            // Entry with wildcards - expand and add each match
+                            const expanded = expandPath(value, path.dirname(devDirectoriesPath));
+                            for (const p of expanded) {
+                                const entryName = path.basename(p);
+                                if (verbose) display(`Found DevDirectory (glob): ${entryName} -> ${p}\n`);
+                                devRoots.set(entryName, p);
+                                addRoot(entryName, p);
                             }
                         } else {
                             const p = canonicalize(value, path.dirname(devDirectoriesPath));
@@ -1025,8 +1194,41 @@ async function main(): Promise<void> {
             if (!rootDir) rootDir = shadowsDir;
 
             const srcRoot = addRoot(projectName || "src", shadowsDir);
-            for (const [shadowName, shadowPath] of shadows) {
+
+            // Add regular shadow entries
+            for (const [shadowName, shadowPath] of shadows.entries) {
                 addRoot(shadowName, shadowPath, srcRoot.path);
+            }
+
+            // Add builds from .lsdev_shadows to buildRoots for processing
+            for (const buildPath of shadows.builds) {
+                if (!buildRoots.includes(buildPath)) {
+                    buildRoots.push(buildPath);
+                }
+            }
+
+            // Process sources from .lsdev_shadows
+            for (const sourcePath of shadows.sources) {
+                if (detectDevdirs && cisdir(sourcePath)) {
+                    try {
+                        for (const subdir of fs.readdirSync(sourcePath)) {
+                            if (subdir === "." || subdir === "..") continue;
+                            const srcDir = path.join(sourcePath, subdir);
+                            if (getPathConfig(srcDir, "ignore")) continue;
+                            if (cisdir(srcDir) && processSourceDir(srcDir)) {
+                                let srcProjectName = getProjectName(srcDir);
+                                if (!srcProjectName) {
+                                    srcProjectName = findDevRootName(srcDir);
+                                    if (!srcProjectName) srcProjectName = path.basename(srcDir);
+                                }
+                                if (verbose) display(`Source Detect (from shadows): ${srcDir} [${srcProjectName}]\n`);
+                                addRoot(srcProjectName, srcDir);
+                            }
+                        }
+                    } catch {
+                        // Ignore directory read errors
+                    }
+                }
             }
         } else {
             const srcMarker = findAncestor(".lsdev_config") ?? findAncestor("configure");
@@ -1133,8 +1335,41 @@ async function main(): Promise<void> {
         const shadowsPath = path.join(devRoot, ".lsdev_shadows");
         if (cexists(shadowsPath)) {
             const shadows = parseFileMap(shadowsPath);
-            for (const [shadowName, shadowPath] of shadows) {
+
+            // Add regular shadow entries
+            for (const [shadowName, shadowPath] of shadows.entries) {
                 addRoot(shadowName, shadowPath, devRoot);
+            }
+
+            // Add builds from .lsdev_shadows
+            for (const buildPath of shadows.builds) {
+                if (!buildRoots.includes(buildPath)) {
+                    buildRoots.push(buildPath);
+                }
+            }
+
+            // Process sources from .lsdev_shadows
+            for (const sourcePath of shadows.sources) {
+                if (detectDevdirs && cisdir(sourcePath)) {
+                    try {
+                        for (const subdir of fs.readdirSync(sourcePath)) {
+                            if (subdir === "." || subdir === "..") continue;
+                            const srcDir = path.join(sourcePath, subdir);
+                            if (getPathConfig(srcDir, "ignore")) continue;
+                            if (cisdir(srcDir) && processSourceDir(srcDir)) {
+                                let srcProjectName = getProjectName(srcDir);
+                                if (!srcProjectName) {
+                                    srcProjectName = findDevRootName(srcDir);
+                                    if (!srcProjectName) srcProjectName = path.basename(srcDir);
+                                }
+                                if (verbose) display(`Source Detect (from shadows): ${srcDir} [${srcProjectName}]\n`);
+                                addRoot(srcProjectName, srcDir);
+                            }
+                        }
+                    } catch {
+                        // Ignore directory read errors
+                    }
+                }
             }
         }
     }

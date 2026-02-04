@@ -8,6 +8,7 @@ build/
 
 # TypeScript cache
 .cache/
+.rollup.cache/
 *.tsbuildinfo
 
 # Environment files
